@@ -1,0 +1,41 @@
+name: Build and Test Incident Triage Agent
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # No live database or API credentials exposed to CI — same
+      # security boundary as previous projects. This validates code
+      # correctness, not live behaviour.
+      - name: Run basic smoke test
+        run: |
+          python -c "
+          import ast
+          for filename in ['app.py', 'triage_graph.py', 'embed_incidents.py', 'ingest_runbooks.py', 'test_retrieval.py']:
+              with open(filename) as f:
+                  source = f.read()
+              try:
+                  ast.parse(source)
+                  print(f'{filename}: syntax OK')
+              except SyntaxError as e:
+                  raise SystemExit(f'{filename}: SYNTAX ERROR - {e}')
+          "
+
+      - name: Build Docker image
+        run: docker build -t incident-triage-app .
