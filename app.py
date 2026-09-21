@@ -11,8 +11,12 @@ pattern as the coffee project's Gradio app). Organized into tabs:
 """
 
 import gradio as gr
+import time
 import plotly.graph_objects as go
-from triage_graph import app as triage_app, ALWAYS_ESCALATE_CATEGORIES, STRONG_MATCH_THRESHOLD, WEAK_MATCH_THRESHOLD
+from triage_graph import (
+    app as triage_app, agentic_app,
+    ALWAYS_ESCALATE_CATEGORIES, STRONG_MATCH_THRESHOLD, WEAK_MATCH_THRESHOLD
+)
 
 DECISION_LABELS = {
     "strong_match": "✅ Strong match — confident response",
@@ -51,6 +55,45 @@ def build_score_chart(incidents, policies):
         margin=dict(t=60, b=100),
     )
     return fig
+
+
+def run_comparison(description: str):
+    if not description.strip():
+        empty = "Enter a description first."
+        return empty, empty, "", ""
+
+    starting_state = {
+        "incident_description": description,
+        "similar_incidents": [],
+        "policy_matches": [],
+        "best_score": 0.0,
+        "decision": "",
+        "response": "",
+        "path": []
+    }
+
+    start_det = time.time()
+    det_result = triage_app.invoke(dict(starting_state))
+    det_time = time.time() - start_det
+
+    start_agentic = time.time()
+    agentic_result = agentic_app.invoke(dict(starting_state))
+    agentic_time = time.time() - start_agentic
+
+    det_text = (
+        f"**Decision:** `{det_result['decision']}`\n"
+        f"**Time:** {det_time*1000:.0f} ms\n"
+        f"**Path:** `{' → '.join(det_result['path'])}`\n\n"
+        f"{det_result['response']}"
+    )
+    agentic_text = (
+        f"**Judgment:** `{agentic_result['decision']}`\n"
+        f"**Time:** {agentic_time*1000:.0f} ms\n"
+        f"**Path:** `{' → '.join(agentic_result['path'])}`\n\n"
+        f"{agentic_result['response']}"
+    )
+
+    return det_text, agentic_text
 
 
 def run_triage(description: str):
@@ -166,6 +209,43 @@ with gr.Blocks(title="Incident Triage Agent") as demo:
 
             gr.Markdown("### Response")
             response_output = gr.Markdown()
+
+        with gr.Tab("Compare: Deterministic vs Agentic"):
+            gr.Markdown(
+                "Ask the same question through two different decision mechanisms: "
+                "a fixed similarity threshold (deterministic) versus an LLM actually "
+                "reading and judging the evidence (agentic). Same data, same search — "
+                "only the decision-making differs. The agentic path then **branches** "
+                "into one of six outcome nodes: `confident_answer`, `answer_with_caveat`, "
+                "`needs_clarification`, `likely_different_issue`, `escalate_recommended`, "
+                "or `out_of_scope`."
+            )
+
+            compare_input = gr.Textbox(
+                label="Describe the incident",
+                placeholder="e.g. Users are reporting slow response times on the dashboard",
+                lines=2
+            )
+            compare_button = gr.Button("Compare Both", variant="primary")
+
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("### ⚙️ Deterministic (threshold-based)")
+                    deterministic_output = gr.Markdown()
+                with gr.Column():
+                    gr.Markdown("### 🧠 Agentic (LLM judgment)")
+                    agentic_output = gr.Markdown()
+
+            compare_button.click(
+                fn=run_comparison,
+                inputs=compare_input,
+                outputs=[deterministic_output, agentic_output]
+            )
+            compare_input.submit(
+                fn=run_comparison,
+                inputs=compare_input,
+                outputs=[deterministic_output, agentic_output]
+            )
 
         with gr.Tab("How it works"):
             gr.Markdown("""

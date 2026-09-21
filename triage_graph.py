@@ -233,10 +233,231 @@ def no_match_node(state: TriageState) -> TriageState:
     print(f"[no_match_node] Generated response:\n{state['response']}")
     return state
 
+# =====================================================
+# AGENTIC DECISION NODE — the LLM-judgment alternative to decide_node
+#
+# Unlike decide_node (a fixed threshold comparison), this asks Claude
+# to actually READ the retrieved incidents/policy content and judge
+# relevance — capable of nuance a fixed number can't capture, such as
+# recognising a high similarity score that's actually about a
+# different underlying problem.
+# =====================================================
+AGENTIC_OUTCOMES = [
+    "confident_answer", "answer_with_caveat", "needs_clarification",
+    "likely_different_issue", "escalate_recommended", "out_of_scope"
+]
+
+
+def agentic_decide_node(state: TriageState) -> TriageState:
+    state["path"].append("agentic_decide")
+
+    incidents_summary = "\n".join(
+        f"- {i['title']} (similarity: {i['similarity']:.2f}, status: {i['status']})"
+        for i in state["similar_incidents"]
+    ) or "None found."
+
+    policy_summary = "\n".join(
+        f"- {p['content'][:120]} (similarity: {p['similarity']:.2f})"
+        for p in state["policy_matches"]
+    ) or "None found."
+
+    prompt = f"""A new incident was reported: "{state['incident_description']}"
+
+Similar past incidents found:
+{incidents_summary}
+
+Relevant policy content found:
+{policy_summary}
+
+Judge this situation and choose exactly ONE outcome:
+- confident_answer: the evidence clearly and directly addresses this incident
+- answer_with_caveat: relevant evidence exists, but with some uncertainty
+- needs_clarification: too ambiguous to answer without more detail
+- likely_different_issue: the retrieved evidence LOOKS similar in wording,
+  but on closer reading is actually about a different underlying problem
+- escalate_recommended: this looks serious enough to warrant human review,
+  regardless of how confident you are
+- out_of_scope: nothing here is genuinely relevant
+
+Respond with only the outcome name, nothing else."""
+
+    response = claude_client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=20,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    judgment = response.content[0].text.strip()
+
+    # Safety net: if the model returns something unexpected, don't crash —
+    # fall back to the safest option.
+    state["decision"] = judgment if judgment in AGENTIC_OUTCOMES else "needs_clarification"
+
+    print(f"[agentic_decide_node] LLM judgment: {state['decision']}")
+    return state
+
 
 # =====================================================
-# Build the graph
+# AGENTIC OUTCOME NODES — one real branch per judgment
+#
+# Same idea as strong/weak/no_match: the decision is not just a label
+# on a single prompt. Each outcome runs different code (LLM draft vs
+# clarifying question vs fixed escalation/out-of-scope text).
 # =====================================================
+def _agentic_policy_override(state: TriageState) -> bool:
+    """Hard rule: protected categories escalate even after an LLM judgment."""
+    if not contains_escalation_keywords(state["incident_description"]):
+        return False
+    state["path"].append("policy_override")
+    state["decision"] = "escalated_by_policy"
+    state["response"] = (
+        "This incident touches checkout/payment/order and is being "
+        "escalated immediately per policy, regardless of the agent's judgment."
+    )
+    print("[agentic] Policy override: protected category detected, escalating instead.")
+    return True
+
+
+def _retrieved_context(state: TriageState) -> tuple[str, str]:
+    incidents_text = "\n".join(
+        f"- {i['title']} (resolution: {i['resolution_notes']})"
+        for i in state["similar_incidents"] if i.get("resolution_notes")
+    ) or "None with resolutions available."
+    policy_text = "\n".join(
+        f"- {p['content']}" for p in state["policy_matches"]
+    ) or "None found."
+    return incidents_text, policy_text
+
+
+def _claude_reply(prompt: str) -> str:
+    response = claude_client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=250,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.content[0].text
+
+
+def confident_answer_node(state: TriageState) -> TriageState:
+    state["path"].append("confident_answer")
+    if _agentic_policy_override(state):
+        return state
+
+    incidents_text, policy_text = _retrieved_context(state)
+    prompt = f"""You are an IT incident triage assistant. Evidence clearly matches this incident.
+
+Incident: "{state['incident_description']}"
+
+Similar past incidents and resolutions:
+{incidents_text}
+
+Relevant policy content:
+{policy_text}
+
+Using ONLY the information above, suggest a likely cause and next step.
+Be concise and specific. Do not hedge unnecessarily."""
+
+    state["response"] = _claude_reply(prompt)
+    print(f"[confident_answer_node] Generated response:\n{state['response']}")
+    return state
+
+
+def answer_with_caveat_node(state: TriageState) -> TriageState:
+    state["path"].append("answer_with_caveat")
+    if _agentic_policy_override(state):
+        return state
+
+    incidents_text, policy_text = _retrieved_context(state)
+    prompt = f"""You are an IT incident triage assistant. Related evidence exists, but you are not fully certain it applies.
+
+Incident: "{state['incident_description']}"
+
+Similar past incidents and resolutions:
+{incidents_text}
+
+Relevant policy content:
+{policy_text}
+
+Using ONLY the information above, suggest a possible cause and next step.
+You MUST state the uncertainty clearly — what might not apply, and what would confirm it."""
+
+    state["response"] = _claude_reply(prompt)
+    print(f"[answer_with_caveat_node] Generated response:\n{state['response']}")
+    return state
+
+
+def needs_clarification_node(state: TriageState) -> TriageState:
+    state["path"].append("needs_clarification")
+    if _agentic_policy_override(state):
+        return state
+
+    best_incident = max(state["similar_incidents"], key=lambda i: i["similarity"], default=None)
+    hint = ""
+    if best_incident:
+        hint = f' The closest past incident was "{best_incident["title"]}" — is this related?'
+
+    state["response"] = (
+        f"I need a bit more detail before I can triage this confidently.{hint} "
+        "Could you say which system or service is affected, and when it started?"
+    )
+    print(f"[needs_clarification_node] Generated response:\n{state['response']}")
+    return state
+
+
+def likely_different_issue_node(state: TriageState) -> TriageState:
+    state["path"].append("likely_different_issue")
+    if _agentic_policy_override(state):
+        return state
+
+    incidents_text, policy_text = _retrieved_context(state)
+    prompt = f"""You are an IT incident triage assistant. Retrieved evidence looks similar in wording, but on closer reading it is about a different underlying problem.
+
+Incident: "{state['incident_description']}"
+
+Retrieved past incidents and resolutions:
+{incidents_text}
+
+Retrieved policy content:
+{policy_text}
+
+Explain briefly why this is probably a different issue, and ask one focused question that would confirm it. Do not treat the retrieved resolutions as the answer."""
+
+    state["response"] = _claude_reply(prompt)
+    print(f"[likely_different_issue_node] Generated response:\n{state['response']}")
+    return state
+
+
+def escalate_recommended_node(state: TriageState) -> TriageState:
+    state["path"].append("escalate_recommended")
+    if _agentic_policy_override(state):
+        return state
+
+    best_incident = max(state["similar_incidents"], key=lambda i: i["similarity"], default=None)
+    related = f' Closest past incident on file: "{best_incident["title"]}".' if best_incident else ""
+
+    state["response"] = (
+        "This incident looks serious enough to warrant human review rather than "
+        f"an automated resolution.{related} Flagging it for an on-call engineer."
+    )
+    print(f"[escalate_recommended_node] Generated response:\n{state['response']}")
+    return state
+
+
+def out_of_scope_node(state: TriageState) -> TriageState:
+    state["path"].append("out_of_scope")
+    if _agentic_policy_override(state):
+        return state
+
+    state["response"] = (
+        "This doesn't appear to match anything in this system's known incident history "
+        "or policy documentation. It may be outside the scope of this system, or may need "
+        "manual review by a human."
+    )
+    print(f"[out_of_scope_node] Generated response:\n{state['response']}")
+    return state
+
+
+
+
 graph = StateGraph(TriageState)
 
 graph.add_node("search", search_node)
@@ -265,6 +486,42 @@ graph.add_edge("weak_match", END)
 graph.add_edge("no_match", END)
 
 app = graph.compile()
+
+# =====================================================
+# SECOND GRAPH — the agentic version
+#
+# Reuses search_node exactly as-is. agentic_decide_node picks one of
+# six outcomes, then a conditional edge runs a different node — same
+# branching mechanism as the deterministic graph, with LLM judgment
+# instead of a similarity threshold.
+# =====================================================
+AGENTIC_OUTCOME_NODES = {
+    "confident_answer": confident_answer_node,
+    "answer_with_caveat": answer_with_caveat_node,
+    "needs_clarification": needs_clarification_node,
+    "likely_different_issue": likely_different_issue_node,
+    "escalate_recommended": escalate_recommended_node,
+    "out_of_scope": out_of_scope_node,
+}
+
+agentic_graph = StateGraph(TriageState)
+
+agentic_graph.add_node("search", search_node)
+agentic_graph.add_node("agentic_decide", agentic_decide_node)
+for name, node_fn in AGENTIC_OUTCOME_NODES.items():
+    agentic_graph.add_node(name, node_fn)
+
+agentic_graph.set_entry_point("search")
+agentic_graph.add_edge("search", "agentic_decide")
+agentic_graph.add_conditional_edges(
+    "agentic_decide",
+    route_after_decision,
+    {name: name for name in AGENTIC_OUTCOME_NODES},
+)
+for name in AGENTIC_OUTCOME_NODES:
+    agentic_graph.add_edge(name, END)
+
+agentic_app = agentic_graph.compile()
 
 
 if __name__ == "__main__":
