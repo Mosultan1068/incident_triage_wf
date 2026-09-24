@@ -57,6 +57,13 @@ def build_score_chart(incidents, policies):
     return fig
 
 
+EMAIL_STATUS_LABELS = {
+    "sent": "📧 Notification email sent",
+    "skipped": "⚪ Email not configured (notification skipped)",
+    "failed": "⚠️ Notification email failed to send — check terminal for details",
+}
+
+
 def run_comparison(description: str):
     if not description.strip():
         empty = "Enter a description first."
@@ -69,7 +76,8 @@ def run_comparison(description: str):
         "best_score": 0.0,
         "decision": "",
         "response": "",
-        "path": []
+        "path": [],
+        "email_status": ""
     }
 
     start_det = time.time()
@@ -80,26 +88,33 @@ def run_comparison(description: str):
     agentic_result = agentic_app.invoke(dict(starting_state))
     agentic_time = time.time() - start_agentic
 
+    det_email = EMAIL_STATUS_LABELS.get(det_result["email_status"], "")
+    agentic_email = EMAIL_STATUS_LABELS.get(agentic_result["email_status"], "")
+
     det_text = (
         f"**Decision:** `{det_result['decision']}`\n"
         f"**Time:** {det_time*1000:.0f} ms\n"
-        f"**Path:** `{' → '.join(det_result['path'])}`\n\n"
+        f"**Path:** `{' → '.join(det_result['path'])}`\n"
+        f"{det_email}\n\n"
         f"{det_result['response']}"
     )
     agentic_text = (
         f"**Judgment:** `{agentic_result['decision']}`\n"
         f"**Time:** {agentic_time*1000:.0f} ms\n"
-        f"**Path:** `{' → '.join(agentic_result['path'])}`\n\n"
+        f"**Path:** `{' → '.join(agentic_result['path'])}`\n"
+        f"{agentic_email}\n\n"
         f"{agentic_result['response']}"
     )
 
     return det_text, agentic_text
 
 
-def run_triage(description: str):
+def run_triage(description: str, progress=gr.Progress()):
     if not description.strip():
         empty = "Please describe an incident first."
-        return empty, "", "", [], [], "", session_history_rows(), empty, go.Figure()
+        return empty, "", "", [], [], "", session_history_rows(), empty, go.Figure(), ""
+
+    progress(0.2, desc="Searching past incidents and policy content...")
 
     result = triage_app.invoke({
         "incident_description": description,
@@ -108,12 +123,16 @@ def run_triage(description: str):
         "best_score": 0.0,
         "decision": "",
         "response": "",
-        "path": []
+        "path": [],
+        "email_status": ""
     })
+
+    progress(0.9, desc="Sending notification...")
 
     decision_label = DECISION_LABELS.get(result["decision"], result["decision"])
     score_text = f"**Best match confidence:** {result['best_score']:.3f}"
     path_text = f"🔀 **Path taken:** `{' → '.join(result['path'])}`"
+    email_text = EMAIL_STATUS_LABELS.get(result["email_status"], "")
 
     # Explicit override note — shown only when the policy actually fired,
     # so it's visible WHY an otherwise strong/weak match got escalated.
@@ -145,7 +164,7 @@ def run_triage(description: str):
 
     return (
         decision_label, score_text, path_text, incidents_table, policy_table,
-        result["response"], session_history_rows(), override_note, score_chart
+        result["response"], session_history_rows(), override_note, score_chart, email_text
     )
 
 
@@ -189,6 +208,7 @@ with gr.Blocks(title="Incident Triage Agent") as demo:
             score_output = gr.Markdown()
             path_output = gr.Markdown()
             override_output = gr.Markdown()
+            email_output = gr.Markdown()
 
             with gr.Row():
                 with gr.Column():
@@ -215,10 +235,7 @@ with gr.Blocks(title="Incident Triage Agent") as demo:
                 "Ask the same question through two different decision mechanisms: "
                 "a fixed similarity threshold (deterministic) versus an LLM actually "
                 "reading and judging the evidence (agentic). Same data, same search — "
-                "only the decision-making differs. The agentic path then **branches** "
-                "into one of six outcome nodes: `confident_answer`, `answer_with_caveat`, "
-                "`needs_clarification`, `likely_different_issue`, `escalate_recommended`, "
-                "or `out_of_scope`."
+                "only the decision-making differs."
             )
 
             compare_input = gr.Textbox(
@@ -280,13 +297,13 @@ Some categories carry consequences too significant for automated confidence alon
         fn=run_triage,
         inputs=description_input,
         outputs=[decision_output, score_output, path_output, incidents_table, policy_table,
-                 response_output, history_table, override_output, chart_output]
+                 response_output, history_table, override_output, chart_output, email_output]
     )
     description_input.submit(
         fn=run_triage,
         inputs=description_input,
         outputs=[decision_output, score_output, path_output, incidents_table, policy_table,
-                 response_output, history_table, override_output, chart_output]
+                 response_output, history_table, override_output, chart_output, email_output]
     )
 
 

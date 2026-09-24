@@ -40,6 +40,7 @@ class TriageState(TypedDict):
     decision: str  # set by the decide node
     response: str  # set by whichever end node runs
     path: list     # every node visited, in order — for display/debugging
+    email_status: str  # set by notify_node: "sent", "skipped", or "failed"
 
 
 # =====================================================
@@ -115,6 +116,12 @@ def route_after_decision(state: TriageState) -> str:
 # Placeholder end nodes — just print for now, real logic comes next
 # =====================================================
 import anthropic
+import smtplib
+from email.mime.text import MIMEText
+
+NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL")
+NOTIFY_EMAIL_APP_PASSWORD = os.environ.get("NOTIFY_EMAIL_APP_PASSWORD")
+NOTIFY_RECIPIENT = os.environ.get("NOTIFY_RECIPIENT")
 
 claude_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 CLAUDE_MODEL = "claude-sonnet-4-5"
@@ -296,168 +303,98 @@ Respond with only the outcome name, nothing else."""
     return state
 
 
-# =====================================================
-# AGENTIC OUTCOME NODES — one real branch per judgment
-#
-# Same idea as strong/weak/no_match: the decision is not just a label
-# on a single prompt. Each outcome runs different code (LLM draft vs
-# clarifying question vs fixed escalation/out-of-scope text).
-# =====================================================
-def _agentic_policy_override(state: TriageState) -> bool:
-    """Hard rule: protected categories escalate even after an LLM judgment."""
-    if not contains_escalation_keywords(state["incident_description"]):
-        return False
-    state["path"].append("policy_override")
-    state["decision"] = "escalated_by_policy"
-    state["response"] = (
-        "This incident touches checkout/payment/order and is being "
-        "escalated immediately per policy, regardless of the agent's judgment."
-    )
-    print("[agentic] Policy override: protected category detected, escalating instead.")
-    return True
+def agentic_response_node(state: TriageState) -> TriageState:
+    state["path"].append("agentic_response")
 
+    # Same protected-category override applies here too — a hard rule
+    # even the agentic path cannot bypass.
+    if contains_escalation_keywords(state["incident_description"]):
+        state["path"].append("policy_override")
+        state["response"] = (
+            "This incident touches checkout/payment/order and is being "
+            "escalated immediately per policy, regardless of the agent's judgment."
+        )
+        return state
 
-def _retrieved_context(state: TriageState) -> tuple[str, str]:
     incidents_text = "\n".join(
         f"- {i['title']} (resolution: {i['resolution_notes']})"
         for i in state["similar_incidents"] if i.get("resolution_notes")
-    ) or "None with resolutions available."
-    policy_text = "\n".join(
-        f"- {p['content']}" for p in state["policy_matches"]
-    ) or "None found."
-    return incidents_text, policy_text
+    )
+    policy_text = "\n".join(f"- {p['content']}" for p in state["policy_matches"])
 
+    prompt = f"""You are an IT incident triage assistant. Your own judgment on
+this incident was: "{state['decision']}"
 
-def _claude_reply(prompt: str) -> str:
+Incident: "{state['incident_description']}"
+
+Similar past incidents and resolutions:
+{incidents_text or "None with resolutions available."}
+
+Relevant policy content:
+{policy_text or "None found."}
+
+Write a short response appropriate to your judgment above — confident if
+you judged this a confident_answer, cautious/caveated if answer_with_caveat,
+a clarifying question if needs_clarification, an explanation of the mismatch
+if likely_different_issue, an escalation notice if escalate_recommended, or
+an out-of-scope message if out_of_scope."""
+
     response = claude_client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=250,
-        messages=[{"role": "user", "content": prompt}],
+        model=CLAUDE_MODEL, max_tokens=250,
+        messages=[{"role": "user", "content": prompt}]
     )
-    return response.content[0].text
-
-
-def confident_answer_node(state: TriageState) -> TriageState:
-    state["path"].append("confident_answer")
-    if _agentic_policy_override(state):
-        return state
-
-    incidents_text, policy_text = _retrieved_context(state)
-    prompt = f"""You are an IT incident triage assistant. Evidence clearly matches this incident.
-
-Incident: "{state['incident_description']}"
-
-Similar past incidents and resolutions:
-{incidents_text}
-
-Relevant policy content:
-{policy_text}
-
-Using ONLY the information above, suggest a likely cause and next step.
-Be concise and specific. Do not hedge unnecessarily."""
-
-    state["response"] = _claude_reply(prompt)
-    print(f"[confident_answer_node] Generated response:\n{state['response']}")
+    state["response"] = response.content[0].text
     return state
 
 
-def answer_with_caveat_node(state: TriageState) -> TriageState:
-    state["path"].append("answer_with_caveat")
-    if _agentic_policy_override(state):
+
+
+# =====================================================
+# NOTIFY NODE — sends the final response as an email
+#
+# Shared by both graphs. Deliberately fails gracefully: if email
+# credentials are missing or sending fails, this logs the error and
+# lets the workflow continue, rather than crashing the whole run over
+# a notification failure — a real response to a real incident should
+# never be lost just because an email couldn't be sent.
+# =====================================================
+def notify_node(state: TriageState) -> TriageState:
+    state["path"].append("notify")
+
+    if not (NOTIFY_EMAIL and NOTIFY_EMAIL_APP_PASSWORD and NOTIFY_RECIPIENT):
+        print("[notify_node] Email credentials not configured — skipping notification.")
+        state["email_status"] = "skipped"
         return state
 
-    incidents_text, policy_text = _retrieved_context(state)
-    prompt = f"""You are an IT incident triage assistant. Related evidence exists, but you are not fully certain it applies.
-
-Incident: "{state['incident_description']}"
-
-Similar past incidents and resolutions:
-{incidents_text}
-
-Relevant policy content:
-{policy_text}
-
-Using ONLY the information above, suggest a possible cause and next step.
-You MUST state the uncertainty clearly — what might not apply, and what would confirm it."""
-
-    state["response"] = _claude_reply(prompt)
-    print(f"[answer_with_caveat_node] Generated response:\n{state['response']}")
-    return state
-
-
-def needs_clarification_node(state: TriageState) -> TriageState:
-    state["path"].append("needs_clarification")
-    if _agentic_policy_override(state):
-        return state
-
-    best_incident = max(state["similar_incidents"], key=lambda i: i["similarity"], default=None)
-    hint = ""
-    if best_incident:
-        hint = f' The closest past incident was "{best_incident["title"]}" — is this related?'
-
-    state["response"] = (
-        f"I need a bit more detail before I can triage this confidently.{hint} "
-        "Could you say which system or service is affected, and when it started?"
+    subject = f"Incident Triage: {state['decision']}"
+    body = (
+        f"Incident description:\n{state['incident_description']}\n\n"
+        f"Decision: {state['decision']}\n"
+        f"Path taken: {' -> '.join(state['path'])}\n\n"
+        f"Response:\n{state['response']}"
     )
-    print(f"[needs_clarification_node] Generated response:\n{state['response']}")
+
+    message = MIMEText(body)
+    message["Subject"] = subject
+    message["From"] = NOTIFY_EMAIL
+    message["To"] = NOTIFY_RECIPIENT
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(NOTIFY_EMAIL, NOTIFY_EMAIL_APP_PASSWORD)
+            server.send_message(message)
+        print(f"[notify_node] Email sent to {NOTIFY_RECIPIENT}")
+        state["email_status"] = "sent"
+    except Exception as e:
+        print(f"[notify_node] Failed to send email: {e}")
+        state["email_status"] = "failed"
+
     return state
 
 
-def likely_different_issue_node(state: TriageState) -> TriageState:
-    state["path"].append("likely_different_issue")
-    if _agentic_policy_override(state):
-        return state
-
-    incidents_text, policy_text = _retrieved_context(state)
-    prompt = f"""You are an IT incident triage assistant. Retrieved evidence looks similar in wording, but on closer reading it is about a different underlying problem.
-
-Incident: "{state['incident_description']}"
-
-Retrieved past incidents and resolutions:
-{incidents_text}
-
-Retrieved policy content:
-{policy_text}
-
-Explain briefly why this is probably a different issue, and ask one focused question that would confirm it. Do not treat the retrieved resolutions as the answer."""
-
-    state["response"] = _claude_reply(prompt)
-    print(f"[likely_different_issue_node] Generated response:\n{state['response']}")
-    return state
-
-
-def escalate_recommended_node(state: TriageState) -> TriageState:
-    state["path"].append("escalate_recommended")
-    if _agentic_policy_override(state):
-        return state
-
-    best_incident = max(state["similar_incidents"], key=lambda i: i["similarity"], default=None)
-    related = f' Closest past incident on file: "{best_incident["title"]}".' if best_incident else ""
-
-    state["response"] = (
-        "This incident looks serious enough to warrant human review rather than "
-        f"an automated resolution.{related} Flagging it for an on-call engineer."
-    )
-    print(f"[escalate_recommended_node] Generated response:\n{state['response']}")
-    return state
-
-
-def out_of_scope_node(state: TriageState) -> TriageState:
-    state["path"].append("out_of_scope")
-    if _agentic_policy_override(state):
-        return state
-
-    state["response"] = (
-        "This doesn't appear to match anything in this system's known incident history "
-        "or policy documentation. It may be outside the scope of this system, or may need "
-        "manual review by a human."
-    )
-    print(f"[out_of_scope_node] Generated response:\n{state['response']}")
-    return state
-
-
-
-
+# =====================================================
+# Build the deterministic graph
+# =====================================================
 graph = StateGraph(TriageState)
 
 graph.add_node("search", search_node)
@@ -465,6 +402,7 @@ graph.add_node("decide", decide_node)
 graph.add_node("strong_match", strong_match_node)
 graph.add_node("weak_match", weak_match_node)
 graph.add_node("no_match", no_match_node)
+graph.add_node("notify", notify_node)
 
 graph.set_entry_point("search")
 graph.add_edge("search", "decide")
@@ -481,45 +419,37 @@ graph.add_conditional_edges(
     }
 )
 
-graph.add_edge("strong_match", END)
-graph.add_edge("weak_match", END)
-graph.add_edge("no_match", END)
+# All three outcomes now flow through notify before ending — a single
+# shared node no path through the graph can bypass, same guarantee
+# principle as the policy override.
+graph.add_edge("strong_match", "notify")
+graph.add_edge("weak_match", "notify")
+graph.add_edge("no_match", "notify")
+graph.add_edge("notify", END)
 
 app = graph.compile()
 
 # =====================================================
 # SECOND GRAPH — the agentic version
 #
-# Reuses search_node exactly as-is. agentic_decide_node picks one of
-# six outcomes, then a conditional edge runs a different node — same
-# branching mechanism as the deterministic graph, with LLM judgment
-# instead of a similarity threshold.
+# Reuses search_node exactly as-is (retrieval doesn't need to differ),
+# but replaces decide_node with agentic_decide_node, and routes
+# straight to a single agentic_response_node rather than three
+# separate outcome nodes — since the judgment itself now determines
+# the response's tone, not a fixed branch.
 # =====================================================
-AGENTIC_OUTCOME_NODES = {
-    "confident_answer": confident_answer_node,
-    "answer_with_caveat": answer_with_caveat_node,
-    "needs_clarification": needs_clarification_node,
-    "likely_different_issue": likely_different_issue_node,
-    "escalate_recommended": escalate_recommended_node,
-    "out_of_scope": out_of_scope_node,
-}
-
 agentic_graph = StateGraph(TriageState)
 
 agentic_graph.add_node("search", search_node)
 agentic_graph.add_node("agentic_decide", agentic_decide_node)
-for name, node_fn in AGENTIC_OUTCOME_NODES.items():
-    agentic_graph.add_node(name, node_fn)
+agentic_graph.add_node("agentic_response", agentic_response_node)
+agentic_graph.add_node("notify", notify_node)
 
 agentic_graph.set_entry_point("search")
 agentic_graph.add_edge("search", "agentic_decide")
-agentic_graph.add_conditional_edges(
-    "agentic_decide",
-    route_after_decision,
-    {name: name for name in AGENTIC_OUTCOME_NODES},
-)
-for name in AGENTIC_OUTCOME_NODES:
-    agentic_graph.add_edge(name, END)
+agentic_graph.add_edge("agentic_decide", "agentic_response")
+agentic_graph.add_edge("agentic_response", "notify")
+agentic_graph.add_edge("notify", END)
 
 agentic_app = agentic_graph.compile()
 
@@ -543,7 +473,8 @@ if __name__ == "__main__":
             "best_score": 0.0,
             "decision": "",
             "response": "",
-            "path": []
+            "path": [],
+            "email_status": ""
         })
         print(f"\nFinal decision: {result['decision']}")
         print(f"Path taken: {' → '.join(result['path'])}")
